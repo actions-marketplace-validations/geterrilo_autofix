@@ -1,0 +1,162 @@
+name: Errilo Auto-fix
+description: Fix production errors reported by Errilo with an AI agent (Claude Code or any MCP agent), then open a pull request.
+author: Errilo
+branding:
+  icon: tool
+  color: orange
+
+# One action, four steps, used in three jobs of your workflow so that the agent never holds a write
+# token. See README.md for the full workflow.
+#
+#   check         job 1, read-only token  decides whether the issue should be fixed
+#   prepare       job 2, read-only token  writes the agent's MCP config and instructions
+#   export        job 2, after the agent  exports the agent's commits as a patch artifact
+#   pull-request  job 3, write token      pushes errilo/fix-<id>, opens the PR, updates Errilo
+
+inputs:
+  step:
+    description: "Which step to run: check, prepare, export or pull-request."
+    required: true
+  errilo-token:
+    description: "Errilo project token (scopes issues:read and issues:write). Required by check and pull-request."
+    required: false
+    default: ""
+  errilo-org:
+    description: "Errilo organization slug, the first path segment of your issue URLs. Required by check and pull-request."
+    required: false
+    default: ""
+  errilo-url:
+    description: "Errilo origin, without a path."
+    required: false
+    default: https://app.errilo.com
+  issue-id:
+    description: "Errilo issue id. check reads it from the alert (repository_dispatch) or from the issue_id input of workflow_dispatch; the other steps take the issue-id output of check."
+    required: false
+    default: ${{ github.event.client_payload.issue_id || github.event.inputs.issue_id }}
+  max-prs-per-day:
+    description: "Cap on the pull requests opened by the auto-fix in 24 hours. Used by check and pull-request."
+    required: false
+    default: "3"
+  github-token:
+    description: "Token that reads the repository (check) or pushes the branch and opens the pull request (pull-request). Use a fine-grained token or a GitHub App token for pull-request, so that your CI runs on the fix."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  proceed:
+    description: "check: true when the issue should be fixed."
+    value: ${{ steps.check.outputs.proceed }}
+  issue-id:
+    description: "check: the validated issue id."
+    value: ${{ steps.check.outputs.issue-id }}
+  prompt:
+    description: "prepare: the prompt to give the agent (the fix_issue prompt of the Errilo MCP server)."
+    value: ${{ steps.prepare.outputs.prompt }}
+  claude-args:
+    description: "prepare: arguments for anthropics/claude-code-action (MCP config, CI instructions, allowed tools)."
+    value: ${{ steps.prepare.outputs.claude-args }}
+  mcp-config:
+    description: "prepare: path of the MCP configuration file, for another agent."
+    value: ${{ steps.prepare.outputs.mcp-config }}
+  instructions:
+    description: "prepare: path of the CI instructions to append to the agent's system prompt, for another agent."
+    value: ${{ steps.prepare.outputs.instructions }}
+  has-fix:
+    description: "export: true when the agent committed a fix."
+    value: ${{ steps.export.outputs.has-fix }}
+  pull-request-url:
+    description: "pull-request: URL of the pull request opened."
+    value: ${{ steps.pr.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the step input
+      shell: bash
+      env:
+        STEP: ${{ inputs.step }}
+      run: |
+        case "$STEP" in
+          check|prepare|export|pull-request) ;;
+          *) echo "::error::Unknown step '$STEP'. Use check, prepare, export or pull-request."; exit 1 ;;
+        esac
+
+    # check ---------------------------------------------------------------------------------------
+    - id: check
+      if: inputs.step == 'check'
+      shell: bash
+      env:
+        # The alert's client_payload comes from an HTTP call: it is data, read through environment
+        # variables only, never written into a script with ${{ }}.
+        RAW_ISSUE_ID: ${{ inputs.issue-id }}
+        TRIGGER: ${{ github.event.client_payload.trigger }}
+        IS_TEST: ${{ github.event.client_payload.test }}
+        EVENT_NAME: ${{ github.event_name }}
+        ERRILO_TOKEN: ${{ inputs.errilo-token }}
+        ERRILO_ORG: ${{ inputs.errilo-org }}
+        ERRILO_URL: ${{ inputs.errilo-url }}
+        MAX_PRS_PER_DAY: ${{ inputs.max-prs-per-day }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/check.sh"
+
+    # prepare -------------------------------------------------------------------------------------
+    - id: prepare
+      if: inputs.step == 'prepare'
+      shell: bash
+      env:
+        RAW_ISSUE_ID: ${{ inputs.issue-id }}
+        ERRILO_URL: ${{ inputs.errilo-url }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/prepare.sh"
+
+    # export --------------------------------------------------------------------------------------
+    - id: export
+      if: inputs.step == 'export'
+      shell: bash
+      env:
+        RAW_ISSUE_ID: ${{ inputs.issue-id }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/export.sh"
+
+    - if: inputs.step == 'export' && steps.export.outputs.has-fix == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: errilo-fix
+        path: ${{ runner.temp }}/errilo-patch/
+        retention-days: 7
+
+    # pull-request --------------------------------------------------------------------------------
+    - if: inputs.step == 'pull-request'
+      uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.repository.default_branch }}
+        token: ${{ inputs.github-token }}
+
+    - if: inputs.step == 'pull-request'
+      uses: actions/download-artifact@v8
+      with:
+        name: errilo-fix
+        path: ${{ runner.temp }}/errilo-patch
+
+    - id: pr
+      if: inputs.step == 'pull-request'
+      shell: bash
+      env:
+        RAW_ISSUE_ID: ${{ inputs.issue-id }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        ERRILO_ORG: ${{ inputs.errilo-org }}
+        ERRILO_URL: ${{ inputs.errilo-url }}
+        MAX_PRS_PER_DAY: ${{ inputs.max-prs-per-day }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/pull-request.sh"
+
+    - if: inputs.step == 'pull-request' && steps.pr.outputs.url != ''
+      shell: bash
+      env:
+        RAW_ISSUE_ID: ${{ inputs.issue-id }}
+        ERRILO_TOKEN: ${{ inputs.errilo-token }}
+        ERRILO_URL: ${{ inputs.errilo-url }}
+        PR_URL: ${{ steps.pr.outputs.url }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/update-issue.sh"

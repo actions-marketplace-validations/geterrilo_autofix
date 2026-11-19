@@ -1,0 +1,100 @@
+# Errilo auto-fix: copy to .github/workflows/errilo-autofix.yml on your default branch.
+# Docs: https://github.com/geterrilo/autofix
+
+name: Errilo auto-fix
+
+on:
+  repository_dispatch:
+    types: [errilo-alert]
+  workflow_dispatch:
+    inputs:
+      issue_id:
+        description: Errilo issue id
+        required: true
+
+permissions: {}
+
+# Errilo delivers alerts "at least once": one run at a time per issue.
+concurrency:
+  group: errilo-autofix-${{ github.event.client_payload.issue_id || inputs.issue_id }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      issue-id: ${{ steps.check.outputs.issue-id }}
+    steps:
+      - id: check
+        uses: geterrilo/autofix@v1
+        with:
+          step: check
+          errilo-token: ${{ secrets.ERRILO_TOKEN }}
+          errilo-org: ${{ vars.ERRILO_ORG }}
+
+  fix:
+    needs: check
+    if: needs.check.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read # the agent can neither push nor open a pull request
+    outputs:
+      has-fix: ${{ steps.export.outputs.has-fix }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Your project's setup, so that the agent can run the tests.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: npm ci
+
+      - id: errilo
+        uses: geterrilo/autofix@v1
+        with:
+          step: prepare
+          issue-id: ${{ needs.check.outputs.issue-id }}
+
+      - uses: anthropics/claude-code-action@v1
+        env:
+          ERRILO_TOKEN: ${{ secrets.ERRILO_TOKEN }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.errilo.outputs.prompt }}
+          claude_args: |
+            ${{ steps.errilo.outputs.claude-args }}
+            --max-turns 80
+
+      - id: export
+        uses: geterrilo/autofix@v1
+        with:
+          step: export
+          issue-id: ${{ needs.check.outputs.issue-id }}
+
+  pull-request:
+    needs: [check, fix]
+    if: needs.fix.outputs.has-fix == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: geterrilo/autofix@v1
+        with:
+          step: pull-request
+          issue-id: ${{ needs.check.outputs.issue-id }}
+          errilo-token: ${{ secrets.ERRILO_TOKEN }}
+          errilo-org: ${{ vars.ERRILO_ORG }}
+          github-token: ${{ secrets.ERRILO_AUTOFIX_GITHUB_TOKEN || github.token }}
