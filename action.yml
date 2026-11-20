@@ -2,7 +2,7 @@ name: Errilo Auto-fix
 description: Fix production errors reported by Errilo with an AI agent (Claude Code or any MCP agent), then open a pull request.
 author: Errilo
 branding:
-  icon: tool
+  icon: activity
   color: orange
 
 # One action, four steps, used in three jobs of your workflow so that the agent never holds a write
